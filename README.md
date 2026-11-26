@@ -53,6 +53,7 @@ Honest labelling, because "it works" is not uniform across these:
 | `notify: ntfy` | **untested.** Same code path as telegram, never run against a live topic |
 | inline buttons (`telegram_poll: 1`) | decision logic tested with a stubbed Telegram API (wrong HMAC, wrong chat, replay, happy path); **never tested against a real dedicated bot** |
 | CLI, MCP server, hash pinning, single use, TTL, rate limits | 16 unprivileged tests, run on every change |
+| running on a second, unrelated host | tested: installed on a second machine and executed a root command after approval (`decided_by root`, log `root`) |
 | multi-user hosts (`socket_mode: 0660` + a group) | **untested.** The default `0666` socket is what has been used |
 
 So: Telegram is the supported, proven channel. Everything else is either
