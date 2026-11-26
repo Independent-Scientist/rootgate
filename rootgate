@@ -38,6 +38,7 @@ DEFAULTS = {
     "notify_file": "",          # for notify=file (test harness)
     "ntfy_url": "https://ntfy.sh",
     "ntfy_topic": "",
+    "socket_mode": "0666",       # see README: any local user may *ask*; approval is separate
     "max_pending": "3",
     "min_interval": "5",
     "exec_timeout": "900",
@@ -611,7 +612,10 @@ def cmd_serve(args, cfg):
         os.unlink(cfg["socket"])
     srv = Server(cfg["socket"], Handler)
     srv.cfg = cfg
-    os.chmod(cfg["socket"], 0o660)
+    # Submitting is unprivileged by design; approving is what needs a token or
+    # root. A 0660 socket owned by root locks out every agent running as the
+    # login user, which is the whole point of the tool.
+    os.chmod(cfg["socket"], int(cfg["socket_mode"], 8))
     if cfg["notify"] == "file" and not cfg["notify_file"]:
         raise SystemExit("notify=file needs notify_file")
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", int(cfg["http_port"])), Page)

@@ -58,6 +58,7 @@ Installs `/usr/local/sbin/rootgate`, `/etc/systemd/system/rootgate.service`,
 | `public_base` | external base URL for approval links, e.g. `https://abc.ngrok-free.app`; empty means `http://127.0.0.1:8733` (useless from a phone) |
 | `http_port` | approval page port, bound to 127.0.0.1 only |
 | `ttl` | seconds an approval stays valid |
+| `socket_mode` | mode of the unix socket, default `0666` (see below) |
 | `max_pending`, `min_interval` | per-uid limits |
 | `exec_timeout` | hard cap on a payload's runtime |
 
@@ -73,6 +74,19 @@ character random topic, or self-host with access control.
 Reaching the page from a phone needs a tunnel you control (`ngrok http 8733` on
 gb360-style box, `ssh -R`), and `public_base` set to it. Do not bind the page to
 anything but loopback.
+
+### Why the socket is 0666
+
+Submitting is unprivileged by design — the approval is what needs a token or
+root. A socket owned `root:root 0660` therefore locks out every agent running as
+the login user, which is the entire point of the tool; that was a real bug here,
+and it fails as `PermissionError: [Errno 13]` in the client.
+
+The trade: any local account can *submit*, i.e. can make your phone buzz. Per-uid
+`max_pending` and `min_interval` bound that, and denying is one tap. On a
+multi-user machine, set `socket_mode` to `0660` and run the daemon with
+`RuntimeDirectory` owned by a `rootgate` group containing only the accounts that
+should be able to ask.
 
 ## Use it
 

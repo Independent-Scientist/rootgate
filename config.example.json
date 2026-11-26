@@ -10,6 +10,7 @@
   "notify_file": "",
   "ntfy_url": "https://ntfy.sh",
   "ntfy_topic": "",
+  "socket_mode": "0666",
   "max_pending": "3",
   "min_interval": "5",
   "exec_timeout": "900"
