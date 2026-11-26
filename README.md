@@ -1,11 +1,23 @@
 # rootgate
 
-A privileged-action broker for *any* agent on the machine. Agents ask; a human
-approves; root runs the exact bytes that were approved.
+**sudo for AI agents — without giving the agent root, or a password.**
 
-It exists because agents (Hermes, Claude Code, Codex, a cron script, a person on
-a phone) all hit the same wall: `sudo` needs a password, an agent has no tty and
-must never hold one. Handing an agent a password, a NOPASSWD rule or a reusable
+[![release](https://img.shields.io/github/v/release/Independent-Scientist/rootgate?label=release)](https://github.com/Independent-Scientist/rootgate/releases)
+[![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![tests](https://img.shields.io/badge/tests-16%20passing-brightgreen)](test-rootgate.sh)
+[![python](https://img.shields.io/badge/python-3.11%2B-blue)](rootgate)
+[![MCP](https://img.shields.io/badge/MCP-stdio%20server-purple)](rootgate-mcp)
+
+`rootgate` is a privileged-action broker: a small privileged daemon that lets an
+AI coding agent — Claude Code, Codex, Cursor, Hermes, or your own script — ask
+for a command to be run as root, and lets a human approve that exact command
+from a phone, a browser, or a root shell.
+
+The agent asks. A human approves. Root runs the exact bytes that were approved.
+Nothing else.
+
+It exists because every agent hits the same wall: `sudo` needs a password, an
+agent has no tty and must never hold one. Handing an agent a password, a NOPASSWD rule or a reusable
 token is worse than the problem. rootgate inverts it: **the agent never gets a
 secret, and the approval travels on a channel the agent cannot read.**
 
@@ -245,6 +257,76 @@ approves, payload runs and log captured, token replay refused, tampered payload
 refused **and not executed**, expiry, rate limiting. The approval page is the
 same code path (GET renders, POST decides) and was verified separately against a
 live daemon.
+
+## FAQ
+
+### How do I let an AI agent run a command as root without giving it a password?
+
+Install rootgate on the machine, register its MCP server with your agent, and the
+agent submits the command instead of running `sudo`. You approve it on your
+phone; the daemon runs it as root. The agent never sees a password, a token or an
+ssh key, and it cannot approve its own request — the token goes to a channel whose
+credentials live in a root-only file.
+
+### Is it safe to give Claude Code (or any agent) sudo?
+
+Indirectly, and deliberately so. The agent gets *no* standing privilege: each
+privileged action is its own request, pinned to a hash, with a TTL and one use.
+The risk that remains is you approving something bad — which is why the page shows
+the payload verbatim, in full, under a warning that it runs as root.
+
+### How is this different from `NOPASSWD` in sudoers?
+
+`NOPASSWD` is a permanent, reusable grant: one prompt-injected line and the agent
+has root for the rest of the session. rootgate grants nothing. Approval is per
+payload, bound to a sha256, expires in ten minutes by default, and is consumed by
+a single execution.
+
+### How is it different from running the agent in a container?
+
+Both are worth doing. A container bounds *what the agent can touch*; rootgate
+answers *what happens when the task genuinely needs the host* — installing a
+package, restarting a service, loading a kernel module, editing `/etc`. Run
+`tools/audit-privilege-paths.sh` too: it finds the group and container grants
+that hand out root silently.
+
+### Does it work with the Model Context Protocol (MCP)?
+
+Yes. `rootgate-mcp` is a stdio MCP server exposing `escalate`,
+`escalation_status`, `escalation_wait`, `escalation_log` and `escalation_list`.
+It deliberately exposes **no approve tool**, so an MCP client cannot approve
+anything — by construction, not by prompt.
+
+### Can I approve from my phone?
+
+Two ways: a link button in Telegram that opens a TLS page with the payload and an
+Approve button, or inline Approve/Deny buttons when the daemon owns a dedicated
+bot. A root shell (`sudo rootgate approve <id>`) also works and is what the
+`console` channel uses.
+
+### What happens if the agent is prompt-injected?
+
+It can submit anything a human will read. It cannot approve, cannot replay a used
+request, cannot change the bytes after approval, and cannot reach the token. The
+defence is a human reading the payload; the page makes that hard to skip, and the
+audit log records every submission and decision.
+
+### Which notification channels are tested?
+
+Telegram, end to end; `console` on real hosts; `ntfy` is code-only so far. The
+"What has actually been tested" table above is the honest list.
+
+### Do I need a VPS?
+
+No. Telegram-only approvals need no page and no tunnel; LAN approval from a shell
+needs nothing at all; a private WireGuard/Tailscale path avoids public exposure.
+A VPS is only for "approve from anywhere", and even then it is a front door — the
+daemon never runs there. See `deploy/vps.md`.
+
+### Does it work on macOS or the BSDs?
+
+It targets Linux (systemd, `/run`, uid-based identity). Nothing in the wire
+protocol is Linux-specific, but the installer and units are. Ports welcome.
 
 ## Layout
 
