@@ -43,9 +43,17 @@ payload looks wrong, deny it — the request is not the action.
 
 ## Install
 
+Two steps: the broker as root, then the Hermes integration as your user.
+
 ```
-sudo ./install.sh
+sudo ./install.sh             # /usr/local/sbin, systemd unit, /etc/rootgate
+./tools/integrate-hermes.sh   # registers the MCP server, installs the skill
 ```
+
+`integrate-hermes.sh` is safe to re-run: it skips registration if the server is
+already configured, runs `hermes mcp test` and fails loudly if the server does
+not answer, and prints the two things only a human can do — type `/reload-mcp`
+in the running session, and set the approval channel.
 
 Installs `/usr/local/sbin/rootgate`, `/etc/systemd/system/rootgate.service`,
 `/etc/rootgate/{config.json,secrets}`, `/var/lib/rootgate`, and enables the unit.
@@ -219,6 +227,7 @@ rootgate.service         systemd unit
 install.sh               root installer
 config.example.json      defaults
 skill/SKILL.md           how an agent should request privilege
+tools/integrate-hermes.sh             MCP + skill wiring for a Hermes install
 tools/audit-privilege-paths.sh        find root-equivalent paths on a host
 tools/remove-container-escalation.sh  remove container-group escalation
 deploy/Caddyfile         reverse proxy for the approval page
