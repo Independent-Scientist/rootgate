@@ -187,16 +187,27 @@ def notify(cfg, rid, meta, token):
         # Approve/deny inline: one tap, no browser, no tunnel. The callback_data
         # carries an HMAC the requester cannot compute, and the bot only accepts
         # presses from the configured chat id.
-        keyboard = {"inline_keyboard": [[
-            {"text": "✅ Approve", "callback_data": cb_data(meta, "a")},
-            {"text": "⛔ Deny", "callback_data": cb_data(meta, "d")},
-        ]]}
-        text = head
-        if cfg["public_base"]:
-            text += f"\nweb: {url}"
-        telegram_api(cfg, "sendMessage", {
-            "chat_id": chat, "text": text,
-            "disable_web_page_preview": True, "reply_markup": keyboard})
+        poll = str(cfg.get("telegram_poll", "0")) not in ("0", "false", "")
+        if poll:
+            keyboard = {"inline_keyboard": [[
+                {"text": "✅ Approve", "callback_data": cb_data(meta, "a")},
+                {"text": "⛔ Deny", "callback_data": cb_data(meta, "d")},
+            ]]}
+            text = head
+        elif cfg["public_base"]:
+            # No callback listener: hand the full URL to the browser via a button.
+            # A URL in message text wraps, and a long-press copy takes only part
+            # of it -- which produces exactly "no such request" on the page.
+            keyboard = {"inline_keyboard": [[
+                {"text": "Open approval page", "url": url}]]}
+            text = head.replace(f"  expires in {int(cfg['ttl'])}s", "")
+        else:
+            keyboard = None
+            text = head
+        payload = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+        if keyboard:
+            payload["reply_markup"] = keyboard
+        telegram_api(cfg, "sendMessage", payload)
         return
     raise RuntimeError(f"unknown notify backend {cfg['notify']}")
 
@@ -807,7 +818,8 @@ def cmd_status(args, cfg):
         print("error:", resp.get("error"), file=sys.stderr)
         return 1
     m = resp["meta"]
-    for k in ("id", "state", "exit_code", "desc", "agent", "sha256", "created", "expires"):
+    for k in ("id", "state", "exit_code", "desc", "agent", "sha256", "created",
+              "expires", "error", "decided_by"):
         if k in m:
             print(f"{k:10} {m[k]}")
     return 0
