@@ -185,11 +185,21 @@ swallow the agent's messages, and the agent the button presses. The default is
 
 ## Publishing the page to a phone
 
-See `deploy/h-vps-1.md`. Two options, in order of preference: a private path
-(WireGuard/Tailscale, no third party), or an SSH reverse forward to a VPS you
-control with Caddy terminating TLS. The token rides in the URL fragment and is
-sent as a header, so it never appears in a request line, a proxy log, or a
-`Referer`. `deploy/Caddyfile` is the proxy config.
+Full runbook: **`deploy/vps.md`**. Two scripts do the work on any host:
+
+```
+sudo ./deploy/vps-provision.sh approve.example.com 2224   # on the VPS: nginx, cert, ufw, relay
+./deploy/target-setup.sh <user>@<vps> approve.example.com 2224   # on the target: key, tunnels
+```
+
+The daemon never runs on the VPS — the VPS is a front door that terminates TLS
+and forwards to a reverse tunnel the target opens outward. Nothing is exposed
+inbound on the target. The token rides in the URL fragment and is sent as a
+header, so it never appears in a request line, a proxy log, or a `Referer`.
+
+Prefer no third party at all? Use WireGuard/Tailscale between phone and target
+and point `public_base` at the private address, or skip the page entirely and use
+the Telegram button path.
 
 ## Operations
 
@@ -248,8 +258,11 @@ skill/SKILL.md           how an agent should request privilege
 tools/integrate-hermes.sh             MCP + skill wiring for a Hermes install
 tools/audit-privilege-paths.sh        find root-equivalent paths on a host
 tools/remove-container-escalation.sh  remove container-group escalation
-deploy/Caddyfile         reverse proxy for the approval page
-deploy/h-vps-1.md        VPS/tunnel runbook
+deploy/vps.md            VPS deployment runbook (start here)
+deploy/vps-provision.sh  VPS side: nginx, Let's Encrypt, ufw, optional ssh relay
+deploy/target-setup.sh   target side: key, ssh config, autossh units
+deploy/Caddyfile         Caddy alternative to nginx
+deploy/nginx-rootgate.conf  reference vhost for manual nginx
 test-rootgate.sh         unprivileged test suite
 ```
 
