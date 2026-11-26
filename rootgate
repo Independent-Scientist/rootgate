@@ -610,6 +610,10 @@ def cmd_serve(args, cfg):
         os.makedirs(d, exist_ok=True)
     if os.path.exists(cfg["socket"]):
         os.unlink(cfg["socket"])
+    # The socket's own mode is not enough: the directory has to be traversable by
+    # the users who are allowed to ask. systemd's RuntimeDirectory default (0750)
+    # silently blocks every non-root client.
+    os.chmod(os.path.dirname(cfg["socket"]), 0o755)
     srv = Server(cfg["socket"], Handler)
     srv.cfg = cfg
     # Submitting is unprivileged by design; approving is what needs a token or

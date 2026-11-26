@@ -43,7 +43,10 @@ fi
 
 install -o root -g root -m 0644 "$HERE/rootgate.service" /etc/systemd/system/rootgate.service
 systemctl daemon-reload
-systemctl enable --now rootgate.service
+systemctl enable rootgate.service
+# `enable --now` does NOT restart a service that is already running, which is how
+# a reinstall leaves the old daemon (and its old socket mode) in place.
+systemctl restart rootgate.service
 
 sleep 0.5
 systemctl --no-pager --lines=5 status rootgate.service || true

@@ -9,7 +9,7 @@ ExecStart=/usr/local/sbin/rootgate serve
 Restart=on-failure
 RestartSec=3
 RuntimeDirectory=rootgate
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 StateDirectory=rootgate
 StateDirectoryMode=0750
 # The payload is arbitrary privileged work by design, so no filesystem sandbox
