@@ -144,6 +144,27 @@ sent as a header, so it never appears in a request line, a proxy log, or a
 - Payloads run via `systemd-run --unit=rootgate-<id> --collect`, so a runaway
   action can be inspected and killed with `systemctl status rootgate-<id>`.
 
+## Audit the host first
+
+A broker is theatre if the same user already has a root-equivalent path. Two
+scripts, both in `tools/`:
+
+```sh
+./tools/audit-privilege-paths.sh          # read-only; exits 1 if it finds a HIGH
+sudo ./tools/remove-container-escalation.sh <user> [--dry-run]
+```
+
+The audit looks for container/VM/disk group membership, container sockets,
+NOPASSWD sudo rules, setuid and capability binaries, writable `PATH` entries,
+permissive polkit rules and unprivileged user namespaces. The removal script
+takes a user out of `docker`/`podman`/`lxd`/`incus` and tightens a
+group-accessible container socket; it does not stop running services, so root-run
+containers keep working.
+
+Run the audit before you install, and again after. If it reports HIGH, fix that
+first — otherwise "approve before root" describes a machine where root is one
+`docker run` away.
+
 ## Tests
 
 ```
@@ -165,6 +186,8 @@ rootgate.service         systemd unit
 install.sh               root installer
 config.example.json      defaults
 skill/SKILL.md           how an agent should request privilege
+tools/audit-privilege-paths.sh        find root-equivalent paths on a host
+tools/remove-container-escalation.sh  remove container-group escalation
 deploy/Caddyfile         reverse proxy for the approval page
 deploy/h-vps-1.md        VPS/tunnel runbook
 test-rootgate.sh         unprivileged test suite
