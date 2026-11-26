@@ -140,7 +140,9 @@ def telegram_api(cfg, method, payload=None, timeout=40):
 
 def notify(cfg, rid, meta, token):
     base = cfg["public_base"] or f"http://127.0.0.1:{cfg['http_port']}"
-    url = f"{base}/a/{token}"
+    # The page reads the request id from the path and the secret from the
+    # fragment; a token in the path can never resolve to a request.
+    url = f"{base}/a/{rid}#t={token}"
     head = (f"rootgate: approval needed\n"
             f"  id      {rid}\n"
             f"  from    {meta['agent']} (uid {meta['submitter']['uid']})\n"
