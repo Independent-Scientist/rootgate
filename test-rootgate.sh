@@ -28,6 +28,7 @@ trap cleanup EXIT
 start() {  # start(ttl, min_interval)
 	export ROOTGATE_TTL=${1:-600}
 	export ROOTGATE_MIN_INTERVAL=${2:-0}
+	export ROOTGATE_HTTP_PORT=$((18800 + RANDOM % 500))   # never rebind a just-closed port
 	# A socket file left by the previous daemon exists but refuses connections, so
 	# wait for an answer, not for the path. (This made the expiry test flaky.)
 	rm -f "$ROOTGATE_SOCKET"
@@ -211,6 +212,88 @@ $RG submit "$T/p1.sh" --desc "first" --name test-agent >/dev/null
 out=$($RG submit "$T/p1.sh" --desc "second" --name test-agent 2>&1)
 printf '%s' "$out" | grep -q "too recently" && ok "second submit refused" || bad "rate limit did not apply: $out"
 stop
+
+echo "[12] a forged id cannot reach outside the state dir"
+start 600 0
+$RG submit "$T/p1.sh" --desc "traversal probe" --name test-agent >/dev/null
+mkdir -p "$T/../rg-outside-$$"
+printf 'OUTSIDE\n' > "$T/../rg-outside-$$/run.log"
+printf '#!/bin/bash\necho EXECUTED-OUTSIDE\n' > "$T/../rg-outside-$$/payload.sh"
+CH=$(sha256sum "$T/../rg-outside-$$/payload.sh" | cut -d' ' -f1)
+TOK=$(python3 -c "import hashlib,json,secrets;t=secrets.token_urlsafe(16);print(t+':'+hashlib.sha256(t.encode()).hexdigest())")
+TRAW=${TOK%%:*}; THASH=${TOK##*:}
+python3 - "$THASH" "$CH" "$T/../rg-outside-$$" <<'PY'
+import json,sys,time
+h,ch,d=sys.argv[1],sys.argv[2],sys.argv[3]
+json.dump({"id":"../../rg-outside","created":int(time.time()),"expires":int(time.time())+600,
+           "sha256":ch,"desc":"forged","agent":"forger","state":"pending",
+           "token_sha256":h,"submitter":{"uid":1000,"pid":1,"exe":"forged","cwd":"/"}},
+          open(d+"/meta.json","w"))
+PY
+out=$(python3 - "$T/../rg-outside-$$" "$TRAW" <<'PY'
+import json,os,sys,socket
+def call(req):
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(os.environ["ROOTGATE_SOCKET"])
+    s.sendall((json.dumps(req)+"\n").encode());d=b""
+    while not d.endswith(b"\n"):
+        c=s.recv(4096)
+        if not c:break
+        d+=c
+    return json.loads(d)
+print(json.dumps(call({"op":"approve","id":"../../"+sys.argv[1].rsplit("/",1)[1],"token":sys.argv[2]})))
+PY
+)
+printf '%s' "$out" | grep -q '"ok": false' && ok "approve with a traversal id refused" || bad "traversal approve was accepted: $out"
+sleep 1
+[ -f "$T/../rg-outside-$$/run.log" ] && ! grep -q EXECUTED "$T/../rg-outside-$$/run.log" 	&& ok "forged payload did not run" || bad "forged payload executed outside the state dir"
+log=$($RG log "../../rg-outside" 2>&1)
+printf '%s' "$log" | grep -q OUTSIDE && bad "log traversal returned foreign data" || ok "log refuses a traversal id"
+rm -rf "$T/../rg-outside-$$"
+stop
+
+echo "[13] the command log is owner-or-root only"
+start 600 0
+$RG submit "$T/p1.sh" --desc "log probe" --name test-agent >/dev/null
+IDL=$($RG list | awk 'NR==1{print $1}')
+out=$(python3 - "$IDL" <<'PY'
+import json,os,socket,sys
+def call(req,uid_note=""):
+    s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.connect(os.environ["ROOTGATE_SOCKET"])
+    s.sendall((json.dumps(req)+"\n").encode());d=b""
+    while not d.endswith(b"\n"):
+        c=s.recv(4096)
+        if not c:break
+        d+=c
+    return json.loads(d)
+r=call({"op":"log","id":sys.argv[1]})
+print("True" if r.get("ok") else "owner-blocked:"+str(r.get("error")))
+PY
+)
+check "$out" "True" "owner can read their own log"
+stop
+
+echo "[14] a wait cannot pin a thread forever"
+export ROOTGATE_MAX_WAIT=2        # observe the clamp without waiting 15 minutes
+start 600 0 || { bad "daemon did not start for the wait test"; exit 1; }
+$RG list >/dev/null 2>&1 || { bad "daemon not answering"; exit 1; }
+$RG submit "$T/p1.sh" --desc "wait probe" --name test-agent >/dev/null
+IDW=$($RG list | awk 'NR==1{print $1}')
+t0=$(date +%s)
+python3 - "$IDW" <<'PY'
+import json,os,socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);s.settimeout(6);s.connect(os.environ["ROOTGATE_SOCKET"])
+s.sendall((json.dumps({"op":"wait","id":sys.argv[1],"timeout":99999999})+"\n").encode())
+try: s.recv(4096)
+except socket.timeout: pass
+PY
+el=$(( $(date +%s) - t0 ))
+[ "$el" -ge 2 ] && [ "$el" -lt 6 ] && ok "wait clamped to max_wait (${el}s)" || bad "wait clamp wrong (${el}s)"
+unset ROOTGATE_MAX_WAIT
+stop
+
+echo "[15] the file notifier keeps the token private"
+mode=$(stat -c '%a' "$ROOTGATE_NOTIFY_FILE" 2>/dev/null || echo missing)
+check "$mode" "600" "notify file is 0600"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL   (state kept in $T)"

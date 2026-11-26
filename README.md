@@ -43,6 +43,21 @@ payload looks wrong, deny it — the request is not the action.
 - **Rate limited.** `max_pending` per uid and `min_interval` between submissions,
   so a runaway agent cannot flood the human into clicking by accident.
 
+## Security
+
+The threat model, the reporting process and the fixed advisories live in
+[SECURITY.md](SECURITY.md). Short version: rootgate assumes the agent can be made
+to submit anything, and defends the *approval* path. It does not defend against
+local root, root-equivalent groups, or a human who approves without reading.
+
+**Upgrading:** 0.3.0 fixes a local privilege escalation (unvalidated request id)
+present up to 0.2.0. If you ran an earlier version on a multi-user host, assume
+local users could have escalated:
+
+```
+sudo ~/rootgate/install.sh    # or wherever you keep the checkout
+```
+
 ## What it does not do
 
 - It is not a sandbox: an approved payload runs as root with a clean env, and can
@@ -334,6 +349,7 @@ protocol is Linux-specific, but the installer and units are. Ports welcome.
 rootgate                 daemon + CLI (one file, python3 stdlib only)
 rootgate-mcp             MCP stdio server (tools for any MCP agent)
 rootgate.service         systemd unit
+SECURITY.md              threat model, reporting, advisories
 install.sh               root installer
 config.example.json      defaults
 skill/SKILL.md           how an agent should request privilege

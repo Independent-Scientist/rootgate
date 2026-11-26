@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import http.server
+import re
 import json
 import os
 import secrets
@@ -26,7 +27,7 @@ import time
 import urllib.parse
 import urllib.request
 
-VERSION = "0.1"
+VERSION = "0.3.0"
 DEFAULTS = {
     "socket": "/run/rootgate/rootgate.sock",
     "state": "/var/lib/rootgate",
@@ -44,6 +45,7 @@ DEFAULTS = {
     "max_pending": "3",
     "min_interval": "5",
     "exec_timeout": "900",
+    "max_wait": "900",           # cap on how long one `wait` may pin a server thread
 }
 
 
@@ -67,12 +69,30 @@ def now():
     return int(time.time())
 
 
+ID_RE = re.compile(r"\A[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\Z")
+
+
+class BadId(ValueError):
+    """An id that did not come from this daemon."""
+
+
 def req_dir(cfg, rid):
+    """Map a request id to its directory, refusing anything that is not one.
+
+    Every path in the daemon is built here, so this is the only place that has
+    to be right: without the shape check, `id` is a path traversal and a forged
+    meta.json outside the state dir becomes an approvable request (local root).
+    """
+    if not isinstance(rid, str) or not ID_RE.match(rid):
+        raise BadId("bad request id")
     return os.path.join(cfg["state"], "requests", rid)
 
 
 def read_meta(cfg, rid):
-    p = os.path.join(req_dir(cfg, rid), "meta.json")
+    try:
+        p = os.path.join(req_dir(cfg, rid), "meta.json")
+    except BadId:
+        return None
     if not os.path.exists(p):
         return None
     with open(p) as fh:
@@ -159,7 +179,20 @@ def notify(cfg, rid, meta, token):
         subprocess.run(["logger", "-t", "rootgate", msg], check=False)
         return
     if cfg["notify"] == "file":
-        with open(cfg["notify_file"], "a") as fh:
+        # This backend writes the live token somewhere on disk. If that path is
+        # readable by the submitter, the agent can approve itself, so refuse
+        # anything group/other-readable rather than trusting the operator.
+        try:
+            mode = os.stat(cfg["notify_file"]).st_mode & 0o777
+        except FileNotFoundError:
+            mode = 0o600
+        if mode & 0o077:
+            raise RuntimeError(
+                f"notify=file target {cfg['notify_file']} is {oct(mode)}; "
+                "the token must not be readable by the agent (chmod 600)")
+        fd = os.open(cfg["notify_file"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            os.fchmod(fd, 0o600)          # umask must not soften this
             fh.write(json.dumps({"id": rid, "url": url, "token": token,
                                  "sha256": meta["sha256"], "desc": meta["desc"]}) + "\n")
         return
@@ -328,8 +361,15 @@ def execute(cfg, rid):
     meta = read_meta(cfg, rid)
     if meta is None:
         return
-    payload = os.path.join(req_dir(cfg, rid), "payload.sh")
-    current = payload_sha(cfg, rid)
+    try:
+        payload = os.path.join(req_dir(cfg, rid), "payload.sh")
+        current = payload_sha(cfg, rid)
+    except (BadId, OSError) as exc:
+        meta["state"] = "failed"
+        meta["error"] = f"payload unreadable: {exc}"
+        write_meta(cfg, rid, meta)
+        audit(cfg, "execution_refused", id=rid, reason=meta["error"])
+        return
     if current != meta["sha256"]:
         meta["state"] = "refused"
         meta["error"] = f"payload changed: {meta['sha256']} -> {current}"
@@ -413,7 +453,15 @@ class Handler(socketserver.StreamRequestHandler):
             return {"ok": True, "requests": self.op_list(cfg)}
         if op == "log":
             rid = req.get("id", "")
-            p = os.path.join(req_dir(cfg, rid), "run.log")
+            try:
+                meta = read_meta(cfg, rid)
+                if not meta or (uid != 0 and meta["submitter"]["uid"] != uid):
+                    # The log is the command's output: root-level data, not a
+                    # public read. Owner or root only.
+                    return {"ok": False, "error": "not authorised"}
+                p = os.path.join(req_dir(cfg, rid), "run.log")
+            except BadId:
+                return {"ok": False, "error": "no such request"}
             if not os.path.exists(p):
                 return {"ok": True, "log": ""}
             with open(p, "rb") as fh:
@@ -423,7 +471,11 @@ class Handler(socketserver.StreamRequestHandler):
         if op == "deny":
             return self.op_decide(cfg, req, uid, approve=False)
         if op == "wait":
-            deadline = now() + int(req.get("timeout", 120))
+            try:
+                want = int(req.get("timeout", 120))
+            except (TypeError, ValueError):
+                want = 120
+            deadline = now() + max(1, min(want, int(cfg["max_wait"])))
             rid = req.get("id", "")
             while now() < deadline:
                 meta = read_meta(cfg, rid)
