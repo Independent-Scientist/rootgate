@@ -1,0 +1,12 @@
+[Unit]
+Description=rootgate approval-page tunnel (VPS 127.0.0.1:8733 -> this host 127.0.0.1:8733)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -R 127.0.0.1:8733:127.0.0.1:8733 rootgate-vps
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
