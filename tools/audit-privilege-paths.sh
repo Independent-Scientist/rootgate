@@ -43,14 +43,17 @@ echo
 echo "== container sockets =="
 sock_seen=0
 for s in /var/run/docker.sock /run/docker.sock /run/podman/podman.sock; do
-	if [ -S "$s" ]; then
-		sock_seen=1
-		st=$(stat -Lc '%U:%G %a' "$s")
-		if [ "${st%% *}" = "root:root" ] && [ "${st##* }" = "660" ]; then
-			say_warn "socket $s exists ($st); only root may use it — confirm it is not group-accessible"
-		else
-			say_high "socket $s exists with $st — anything that can open it is root"
-		fi
+	[ -S "$s" ] || continue
+	sock_seen=1
+	g=$(stat -Lc '%G' "$s")
+	m=$(stat -Lc '%a' "$s")
+	if printf '%s\n' $MYGROUPS | grep -qx "$g"; then
+		say_high "socket $s is openable by you (group $g, mode $m): starting a container is root"
+	else
+		case ${m: -1} in
+		2|3|6|7) say_high "socket $s is world-writable (mode $m)" ;;
+		*) say_ok "socket $s exists (group $g, mode $m) but you are not in '$g'" ;;
+		esac
 	fi
 done
 [ "$sock_seen" -eq 1 ] || say_ok "no container socket"
