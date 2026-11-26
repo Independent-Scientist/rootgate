@@ -143,7 +143,7 @@ def notify(cfg, rid, meta, token):
     # The page reads the request id from the path and the secret from the
     # fragment; a token in the path can never resolve to a request.
     url = f"{base}/a/{rid}#t={token}"
-    head = (f"rootgate: approval needed\n"
+    head = (f"rootgate: approval needed — this runs as ROOT on {socket.gethostname()}\n"
             f"  id      {rid}\n"
             f"  from    {meta['agent']} (uid {meta['submitter']['uid']})\n"
             f"  what    {meta['desc']}\n"
@@ -573,9 +573,15 @@ SHELL_PAGE = """<!doctype html>
  button{font-size:1.05em;padding:.6em 1.2em;margin:.4em .6em .4em 0;border-radius:6px;border:1px solid #888}
  .bad{background:#a11;color:#fff;border-color:#a11}
  .ok{background:#116b2c;color:#fff;border-color:#116b2c}
+ .warn{background:#7a1010;color:#fff;padding:.9em 1em;border-radius:8px;margin:0 0 1em;
+       font-size:.97em;line-height:1.35}
  code{word-break:break-all}
 </style>
 <h2>Privileged action requested</h2>
+<div id=warn class=warn>⚠️ <b>This runs as ROOT with full, unrestricted privilege.</b>
+It can install software, rewrite boot configuration, delete any file, or open
+this machine to the network. Read every line of the payload before approving.
+If you did not ask for this action, deny it.</div>
 <div id=meta>loading…</div>
 <div id=body></div>
 <script>
@@ -593,7 +599,8 @@ fetch("/api/r/" + encodeURIComponent(id), {headers: {"X-Rootgate-Token": tok}})
     meta.textContent = "";
     row("id", j.id); row("from", j.agent + " (uid " + j.uid + ", pid " + j.pid + ")");
     row("exe", j.exe); row("cwd", j.cwd); row("what", j.desc);
-    row("sha256", j.sha256); row("expires", "in " + j.expires_in + "s");
+    row("sha256", j.sha256); row("host", j.host);
+    row("expires", "in " + j.expires_in + "s");
     body.append(el("p", "This runs as root if you approve. Read it first."));
     body.append(el("pre", j.payload));
     const okb = el("button", "Approve"); okb.className = "ok";
@@ -671,6 +678,7 @@ class Page(http.server.BaseHTTPRequestHandler):
                 "uid": meta["submitter"]["uid"], "pid": meta["submitter"]["pid"],
                 "exe": meta["submitter"]["exe"], "cwd": meta["submitter"]["cwd"],
                 "expires_in": max(0, meta["expires"] - now()),
+                "host": socket.gethostname(),
             })
         return self._send(404, "not found")
 
