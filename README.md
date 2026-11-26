@@ -41,6 +41,23 @@ payload looks wrong, deny it — the request is not the action.
 - It does not make an agent trustworthy, it makes its privilege requests visible
   and refusable.
 
+## What has actually been tested
+
+Honest labelling, because "it works" is not uniform across these:
+
+| area | status |
+|---|---|
+| `notify: telegram` — message delivery, link button, approval round trip | **tested end to end** against the live Bot API; this is the only notification channel exercised for real |
+| approval page over TLS (nginx + reverse tunnel + cert) | tested end to end; a submitted command ran as root from a phone approval |
+| `notify: console` | exercised on a real host — the prompt lands in the journal and `sudo rootgate approve` works |
+| `notify: ntfy` | **untested.** Same code path as telegram, never run against a live topic |
+| inline buttons (`telegram_poll: 1`) | decision logic tested with a stubbed Telegram API (wrong HMAC, wrong chat, replay, happy path); **never tested against a real dedicated bot** |
+| CLI, MCP server, hash pinning, single use, TTL, rate limits | 16 unprivileged tests, run on every change |
+| multi-user hosts (`socket_mode: 0660` + a group) | **untested.** The default `0666` socket is what has been used |
+
+So: Telegram is the supported, proven channel. Everything else is either
+partially exercised or code-only — treat it as "probably fine", not as verified.
+
 ## Install
 
 Two steps: the broker as root, then the Hermes integration as your user.
@@ -62,7 +79,7 @@ Installs `/usr/local/sbin/rootgate`, `/etc/systemd/system/rootgate.service`,
 
 | key | meaning |
 |---|---|
-| `notify` | `console` (default), `telegram`, `ntfy`, `file` (tests only) |
+| `notify` | `console` (default), `telegram` (**the only channel tested against a real service**), `ntfy` (untested), `file` (tests only) |
 | `telegram_poll` | `1` only with a bot dedicated to rootgate; enables inline buttons |
 | `public_base` | external base URL for approval links, e.g. `https://abc.ngrok-free.app`; empty means `http://127.0.0.1:8733` (useless from a phone) |
 | `http_port` | approval page port, bound to 127.0.0.1 only |
