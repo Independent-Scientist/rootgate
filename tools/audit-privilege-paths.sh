@@ -41,8 +41,10 @@ fi
 
 echo
 echo "== container sockets =="
+sock_seen=0
 for s in /var/run/docker.sock /run/docker.sock /run/podman/podman.sock; do
 	if [ -S "$s" ]; then
+		sock_seen=1
 		st=$(stat -Lc '%U:%G %a' "$s")
 		if [ "${st%% *}" = "root:root" ] && [ "${st##* }" = "660" ]; then
 			say_warn "socket $s exists ($st); only root may use it — confirm it is not group-accessible"
@@ -51,7 +53,7 @@ for s in /var/run/docker.sock /run/docker.sock /run/podman/podman.sock; do
 		fi
 	fi
 done
-ls -l /var/run/docker.sock /run/podman/podman.sock >/dev/null 2>&1 || say_ok "no container socket"
+[ "$sock_seen" -eq 1 ] || say_ok "no container socket"
 
 echo
 echo "== sudo rules =="
