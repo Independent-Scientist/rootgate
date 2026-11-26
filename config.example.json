@@ -1,0 +1,16 @@
+{
+  "socket": "/run/rootgate/rootgate.sock",
+  "state": "/var/lib/rootgate",
+  "log": "/var/log/rootgate.log",
+  "secrets": "/etc/rootgate/secrets",
+  "http_port": "8733",
+  "public_base": "",
+  "ttl": "600",
+  "notify": "console",
+  "notify_file": "",
+  "ntfy_url": "https://ntfy.sh",
+  "ntfy_topic": "",
+  "max_pending": "3",
+  "min_interval": "5",
+  "exec_timeout": "900"
+}

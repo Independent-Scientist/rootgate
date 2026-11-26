@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+# rootgate-mcp — MCP (stdio) front-end for rootgate.
+#
+# Any MCP-capable agent gets these tools; none of them can approve anything.
+# The approval goes to the human's channel, not back through the agent.
+#
+# SPDX-License-Identifier: MIT
+import json
+import os
+import socket
+import sys
+
+VERSION = "0.1"
+SOCKET_PATH = os.environ.get("ROOTGATE_SOCKET", "/run/rootgate/rootgate.sock")
+PROTOCOL = "2024-11-05"
+
+TOOLS = [
+    {
+        "name": "escalate",
+        "description": ("Run a shell script as root, after a human approves it. "
+                        "Use for anything needing privilege (installing, systemctl, "
+                        "editing /etc, mounting). The human sees the exact script and "
+                        "its sha256 in their approval channel. Never ask the user for a "
+                        "password: submit here instead. Returns an id; poll with "
+                        "escalation_status or block with escalation_wait."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "script": {"type": "string",
+                           "description": "Full bash script to run as root. Be explicit; it is reviewed verbatim."},
+                "desc": {"type": "string",
+                         "description": "One line shown to the human: what this does and why."},
+                "name": {"type": "string",
+                         "description": "Who is asking (e.g. 'hermes', 'claude-code')."},
+                "wait_seconds": {"type": "integer",
+                                 "description": "If >0, block up to this long for the decision (default 0).",
+                                 "default": 0},
+            },
+            "required": ["script", "desc"],
+        },
+    },
+    {
+        "name": "escalation_status",
+        "description": "State of an escalation: pending, approved, denied, running, done, failed, expired, refused.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+    },
+    {
+        "name": "escalation_wait",
+        "description": "Block until an escalation is decided and finished (or the timeout expires). Returns state, exit code and log.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"},
+                           "timeout_s": {"type": "integer", "default": 300}},
+            "required": ["id"],
+        },
+    },
+    {
+        "name": "escalation_log",
+        "description": "Output of an escalation that ran.",
+        "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+    },
+    {
+        "name": "escalation_list",
+        "description": "Recent escalations with state, requester and description.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def call(req, timeout=30):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(SOCKET_PATH)
+    s.sendall((json.dumps(req) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    return json.loads(buf or b"{}")
+
+
+def tool_escalate(a):
+    script = a.get("script") or ""
+    if not script.strip():
+        return err("script is empty")
+    import base64
+    resp = call({"op": "submit",
+                 "script": base64.b64encode(script.encode()).decode(),
+                 "desc": a.get("desc", ""),
+                 "name": a.get("name", os.environ.get("ROOTGATE_AGENT", "mcp"))})
+    if not resp.get("ok"):
+        return err(resp.get("error", "submit failed"))
+    out = {"id": resp["id"], "sha256": resp["sha256"],
+           "expires": resp["expires"], "state": "pending",
+           "note": "sent to the human's approval channel; this call cannot approve it"}
+    wait = int(a.get("wait_seconds") or 0)
+    if wait > 0:
+        meta = call({"op": "wait", "id": resp["id"], "timeout": wait}, timeout=wait + 10).get("meta", {})
+        out.update({k: meta.get(k) for k in ("state", "exit_code") if k in meta})
+        if meta.get("state") in ("done", "failed"):
+            out["log"] = call({"op": "log", "id": resp["id"]}).get("log", "")[-4000:]
+    return ok(out)
+
+
+def tool_status(a):
+    resp = call({"op": "status", "id": a.get("id", "")})
+    if not resp.get("ok"):
+        return err(resp.get("error", "no such escalation"))
+    m = resp["meta"]
+    return ok({k: m.get(k) for k in ("id", "state", "exit_code", "desc", "agent",
+                                     "sha256", "created", "expires") if k in m})
+
+
+def tool_wait(a):
+    rid = a.get("id", "")
+    t = int(a.get("timeout_s") or 300)
+    resp = call({"op": "wait", "id": rid, "timeout": t}, timeout=t + 10)
+    if not resp.get("ok"):
+        return err(resp.get("error", "no such escalation"))
+    m = resp["meta"]
+    out = {k: m.get(k) for k in ("id", "state", "exit_code") if k in m}
+    if m["state"] in ("done", "failed"):
+        out["log"] = call({"op": "log", "id": rid}).get("log", "")[-8000:]
+    elif m["state"] in ("denied", "expired", "refused"):
+        out["note"] = "the human did not approve this action; do not retry without asking why"
+    return ok(out)
+
+
+def tool_log(a):
+    return ok({"log": call({"op": "log", "id": a.get("id", "")}).get("log", "")})
+
+
+def tool_list(_a):
+    resp = call({"op": "list"})
+    items = [{k: m.get(k) for k in ("id", "state", "exit_code", "agent", "desc", "created")
+              if k in m} for m in resp.get("requests", [])]
+    return ok({"requests": items})
+
+
+HANDLERS = {
+    "escalate": tool_escalate,
+    "escalation_status": tool_status,
+    "escalation_wait": tool_wait,
+    "escalation_log": tool_log,
+    "escalation_list": tool_list,
+}
+
+
+def ok(payload):
+    return {"content": [{"type": "text", "text": json.dumps(payload, indent=1)}]}
+
+
+def err(msg):
+    return {"isError": True, "content": [{"type": "text", "text": str(msg)}]}
+
+
+def handle(msg):
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        return {"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": PROTOCOL,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "rootgate", "version": VERSION},
+        }}
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return None
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": mid, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}}
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        fn = HANDLERS.get(params.get("name"))
+        if not fn:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32601, "message": f"unknown tool {params.get('name')}"}}
+        try:
+            return {"jsonrpc": "2.0", "id": mid, "result": fn(params.get("arguments") or {})}
+        except FileNotFoundError:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": err(f"rootgate daemon not reachable at {SOCKET_PATH}")}
+        except Exception as exc:                       # noqa: BLE001
+            return {"jsonrpc": "2.0", "id": mid, "result": err(f"{type(exc).__name__}: {exc}")}
+    return {"jsonrpc": "2.0", "id": mid,
+            "error": {"code": -32601, "message": f"unknown method {method}"}}
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        out = handle(msg)
+        if out is not None:
+            sys.stdout.write(json.dumps(out) + "\n")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()

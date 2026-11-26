@@ -1,0 +1,22 @@
+[Unit]
+Description=rootgate — agent-agnostic privileged action broker
+Documentation=file:/usr/local/share/doc/rootgate/README.md
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/rootgate serve
+Restart=on-failure
+RestartSec=3
+RuntimeDirectory=rootgate
+RuntimeDirectoryMode=0750
+StateDirectory=rootgate
+StateDirectoryMode=0750
+# The payload is arbitrary privileged work by design, so no filesystem sandbox
+# here — the approval gate, not the sandbox, is the control. Keep the daemon
+# itself from gaining new privileges through it.
+NoNewPrivileges=no
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

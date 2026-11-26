@@ -1,0 +1,775 @@
+#!/usr/bin/env python3
+# rootgate — agent-agnostic broker for privileged actions.
+#
+# Any process can *ask*; only a human can *approve*; root executes the exact
+# bytes that were approved. The approval secret travels on a channel the agent
+# cannot read (console, ntfy topic, or a file the test harness owns) — never
+# through the requesting process.
+#
+# SPDX-License-Identifier: MIT
+import argparse
+import base64
+import hashlib
+import hmac
+import http.server
+import json
+import os
+import secrets
+import shutil
+import socket
+import socketserver
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+VERSION = "0.1"
+DEFAULTS = {
+    "socket": "/run/rootgate/rootgate.sock",
+    "state": "/var/lib/rootgate",
+    "log": "/var/log/rootgate.log",
+    "secrets": "/etc/rootgate/secrets",
+    "http_port": "8733",
+    "public_base": "",          # e.g. https://abc.ngrok-free.app
+    "ttl": "600",
+    "notify": "console",        # console | file | ntfy
+    "notify_file": "",          # for notify=file (test harness)
+    "ntfy_url": "https://ntfy.sh",
+    "ntfy_topic": "",
+    "max_pending": "3",
+    "min_interval": "5",
+    "exec_timeout": "900",
+}
+
+
+# ---------------------------------------------------------------- config
+def load_config():
+    cfg = dict(DEFAULTS)
+    path = os.environ.get("ROOTGATE_CONFIG", "/etc/rootgate/config.json")
+    if os.path.exists(path):
+        with open(path) as fh:
+            cfg.update(json.load(fh))
+    for k, v in os.environ.items():
+        if k.startswith("ROOTGATE_"):
+            key = k[len("ROOTGATE_"):].lower()
+            if key in cfg:
+                cfg[key] = v
+    return cfg
+
+
+# ---------------------------------------------------------------- helpers
+def now():
+    return int(time.time())
+
+
+def req_dir(cfg, rid):
+    return os.path.join(cfg["state"], "requests", rid)
+
+
+def read_meta(cfg, rid):
+    p = os.path.join(req_dir(cfg, rid), "meta.json")
+    if not os.path.exists(p):
+        return None
+    with open(p) as fh:
+        return json.load(fh)
+
+
+def write_meta(cfg, rid, meta):
+    p = os.path.join(req_dir(cfg, rid), "meta.json")
+    tmp = p + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(meta, fh, indent=1, sort_keys=True)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, p)
+
+
+def audit(cfg, event, **kw):
+    rec = {"ts": now(), "event": event}
+    rec.update(kw)
+    line = json.dumps(rec, sort_keys=True)
+    with open(cfg["log"], "a") as fh:
+        fh.write(line + "\n")
+        fh.flush()
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def payload_sha(cfg, rid):
+    return sha256_file(os.path.join(req_dir(cfg, rid), "payload.sh"))
+
+
+def notify(cfg, rid, meta, token):
+    base = cfg["public_base"] or f"http://127.0.0.1:{cfg['http_port']}"
+    url = f"{base}/a/{token}"
+    head = (f"rootgate: approval needed\n"
+            f"  id      {rid}\n"
+            f"  from    {meta['agent']} (uid {meta['submitter']['uid']})\n"
+            f"  what    {meta['desc']}\n"
+            f"  sha256  {meta['sha256']}\n"
+            f"  expires in {int(cfg['ttl'])}s\n")
+    if cfg["notify"] == "console":
+        msg = head + f"  open    {url}\n"
+        try:
+            with open("/dev/console", "w") as fh:
+                fh.write("\n" + msg + "\n")
+        except OSError:
+            pass
+        subprocess.run(["logger", "-t", "rootgate", msg], check=False)
+        return
+    if cfg["notify"] == "file":
+        with open(cfg["notify_file"], "a") as fh:
+            fh.write(json.dumps({"id": rid, "url": url, "token": token,
+                                 "sha256": meta["sha256"], "desc": meta["desc"]}) + "\n")
+        return
+    if cfg["notify"] == "ntfy":
+        topic = cfg["ntfy_topic"]
+        if not topic:
+            raise RuntimeError("notify=ntfy but ntfy_topic is empty")
+        body = head.encode()
+        req = urllib.request.Request(
+            f"{cfg['ntfy_url']}/{topic}",
+            data=body,
+            headers={"Title": "rootgate approval needed",
+                     "Priority": "high",
+                     "Tags": "rotating_light",
+                     "Actions": f"view, Approve/deny, {url}, clear=true"},
+            method="POST")
+        urllib.request.urlopen(req, timeout=10).read()
+        return
+    if cfg["notify"] == "telegram":
+        # Credentials live in the secrets file (root-only), so no agent can read
+        # them and no agent can deliver or intercept the approval link.
+        secrets = read_secrets(cfg)
+        tok = secrets.get("TELEGRAM_BOT_TOKEN")
+        chat = secrets.get("TELEGRAM_CHAT_ID")
+        if not tok or not chat:
+            raise RuntimeError("notify=telegram needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        text = head + f"\nApproval: {url}"
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            data=json.dumps({
+                "chat_id": chat,
+                "text": text,
+                "disable_web_page_preview": True,
+                "reply_markup": {"inline_keyboard": [[
+                    {"text": "Review and approve", "url": url}]]},
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        urllib.request.urlopen(req, timeout=15).read()
+        return
+    raise RuntimeError(f"unknown notify backend {cfg['notify']}")
+
+
+def read_secrets(cfg):
+    out = {}
+    path = cfg["secrets"]
+    if os.path.exists(path):
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+    return out
+
+
+# ---------------------------------------------------------------- execution
+def execute(cfg, rid):
+    meta = read_meta(cfg, rid)
+    if meta is None:
+        return
+    payload = os.path.join(req_dir(cfg, rid), "payload.sh")
+    current = payload_sha(cfg, rid)
+    if current != meta["sha256"]:
+        meta["state"] = "refused"
+        meta["error"] = f"payload changed: {meta['sha256']} -> {current}"
+        write_meta(cfg, rid, meta)
+        audit(cfg, "execution_refused", id=rid, reason=meta["error"])
+        return
+
+    meta["state"] = "running"
+    meta["started"] = now()
+    write_meta(cfg, rid, meta)
+    audit(cfg, "execution_start", id=rid, sha256=current, agent=meta["agent"])
+
+    log_path = os.path.join(req_dir(cfg, rid), "run.log")
+    timeout = int(cfg["exec_timeout"])
+    try:
+        if os.geteuid() == 0:
+            cmd = ["systemd-run", "--unit", f"rootgate-{rid}", "--collect",
+                   "--pipe", "--wait", "--quiet",
+                   "/bin/bash", payload]
+        else:                       # test mode: no privilege, no systemd
+            cmd = ["/bin/bash", payload]
+        with open(log_path, "wb") as out:
+            proc = subprocess.run(cmd, stdout=out, stderr=subprocess.STDOUT,
+                                  cwd="/", timeout=timeout,
+                                  env={"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                                       "HOME": "/root", "TERM": "dumb"})
+        rc = proc.returncode
+        state = "done" if rc == 0 else "failed"
+    except subprocess.TimeoutExpired:
+        rc = 124
+        state = "failed"
+        with open(log_path, "ab") as out:
+            out.write(b"\nrootgate: execution timed out\n")
+    meta = read_meta(cfg, rid)
+    meta["state"] = state
+    meta["exit_code"] = rc
+    meta["ended"] = now()
+    write_meta(cfg, rid, meta)
+    audit(cfg, "execution_end", id=rid, rc=rc, state=state)
+
+
+# ---------------------------------------------------------------- server
+class Handler(socketserver.StreamRequestHandler):
+    def handle(self):
+        creds = self.request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                        struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", creds)
+        line = self.rfile.readline(1 << 20)
+        if not line:
+            return
+        try:
+            req = json.loads(line)
+        except ValueError:
+            self.reply({"ok": False, "error": "bad json"})
+            return
+        try:
+            resp = self.dispatch(req, uid)
+        except Exception as exc:                     # noqa: BLE001
+            resp = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        self.reply(resp)
+
+    def reply(self, obj):
+        self.wfile.write((json.dumps(obj) + "\n").encode())
+        self.wfile.flush()
+
+    # --- operations -----------------------------------------------------
+    def dispatch(self, req, uid):
+        cfg = self.server.cfg
+        op = req.get("op")
+        if op == "ping":
+            return {"ok": True, "version": VERSION, "euid": os.geteuid()}
+
+        if op == "submit":
+            return self.op_submit(cfg, req, uid)
+        if op == "status":
+            meta = read_meta(cfg, req.get("id", ""))
+            if not meta:
+                return {"ok": False, "error": "no such request"}
+            return {"ok": True, "meta": public_meta(cfg, meta)}
+        if op == "list":
+            return {"ok": True, "requests": self.op_list(cfg)}
+        if op == "log":
+            rid = req.get("id", "")
+            p = os.path.join(req_dir(cfg, rid), "run.log")
+            if not os.path.exists(p):
+                return {"ok": True, "log": ""}
+            with open(p, "rb") as fh:
+                return {"ok": True, "log": fh.read().decode("utf-8", "replace")}
+        if op == "approve":
+            return self.op_decide(cfg, req, uid, approve=True)
+        if op == "deny":
+            return self.op_decide(cfg, req, uid, approve=False)
+        if op == "wait":
+            deadline = now() + int(req.get("timeout", 120))
+            rid = req.get("id", "")
+            while now() < deadline:
+                meta = read_meta(cfg, rid)
+                if not meta:
+                    return {"ok": False, "error": "no such request"}
+                if meta["state"] in ("done", "failed", "denied", "expired", "refused", "cancelled"):
+                    return {"ok": True, "meta": public_meta(cfg, meta)}
+                time.sleep(0.5)
+            meta = read_meta(cfg, rid)
+            return {"ok": True, "meta": public_meta(cfg, meta)}
+        return {"ok": False, "error": f"unknown op {op}"}
+
+    def op_submit(self, cfg, req, uid):
+        script = req.get("script")
+        if not script:
+            return {"ok": False, "error": "empty payload"}
+        raw = base64.b64decode(script)
+        if len(raw) > 256 * 1024:
+            return {"ok": False, "error": "payload too large"}
+
+        # rate limits, so one run-away agent cannot flood a human with prompts
+        pend = [m for m in self.all_metas(cfg)
+                if m["state"] == "pending" and m["submitter"]["uid"] == uid]
+        if len(pend) >= int(cfg["max_pending"]):
+            return {"ok": False, "error": "too many pending requests for this uid"}
+        recent = [m for m in self.all_metas(cfg) if m["submitter"]["uid"] == uid]
+        if recent:
+            last = max(m["created"] for m in recent)
+            if now() - last < int(cfg["min_interval"]):
+                return {"ok": False, "error": "submitted too recently; wait a moment"}
+
+        rid = "%s-%s" % (time.strftime("%Y%m%d-%H%M%S", time.localtime()),
+                         secrets.token_hex(4))
+        d = req_dir(cfg, rid)
+        os.makedirs(d, mode=0o700)
+        payload = os.path.join(d, "payload.sh")
+        with open(payload, "wb") as fh:
+            fh.write(raw)
+        os.chmod(payload, 0o600)
+
+        token = secrets.token_urlsafe(32)
+        meta = {
+            "id": rid,
+            "created": now(),
+            "expires": now() + int(cfg["ttl"]),
+            "sha256": sha256_file(payload),
+            "desc": (req.get("desc") or "").strip()[:400] or "(no description)",
+            "agent": (req.get("name") or "unknown")[:60],
+            "submitter": self.identify(uid),
+            "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+            "state": "pending",
+        }
+        write_meta(cfg, rid, meta)
+        audit(cfg, "submit", id=rid, uid=uid, agent=meta["agent"],
+              sha256=meta["sha256"], desc=meta["desc"])
+        try:
+            notify(cfg, rid, meta, token)
+        except Exception as exc:                      # noqa: BLE001
+            meta["state"] = "cancelled"
+            meta["error"] = f"notification failed: {exc}"
+            write_meta(cfg, rid, meta)
+            return {"ok": False, "error": meta["error"], "id": rid}
+        # NOTE: the token is deliberately absent from this response.
+        return {"ok": True, "id": rid, "sha256": meta["sha256"],
+                "expires": meta["expires"],
+                "note": "approval request sent to the human's channel; "
+                        "poll with: rootgate wait <id>"}
+
+    def op_decide(self, cfg, req, uid, approve):
+        rid = req.get("id", "")
+        meta = read_meta(cfg, rid)
+        if not meta:
+            return {"ok": False, "error": "no such request"}
+        if meta["state"] != "pending":
+            return {"ok": False, "error": f"request is {meta['state']}"}
+        if now() > meta["expires"]:
+            meta["state"] = "expired"
+            write_meta(cfg, rid, meta)
+            return {"ok": False, "error": "request expired"}
+
+        # two ways to be the human: hold the token, or be root on this machine
+        got = req.get("token") or ""
+        token_ok = bool(got) and hmac.compare_digest(
+            hashlib.sha256(got.encode()).hexdigest(), meta["token_sha256"])
+        if not token_ok and uid != 0:
+            audit(cfg, "decision_rejected", id=rid, uid=uid)
+            return {"ok": False, "error": "not authorised: bad token and not root"}
+
+        meta["state"] = "approved" if approve else "denied"
+        meta["decided_by"] = "root" if (uid == 0 and not token_ok) else "token"
+        meta["decided"] = now()
+        write_meta(cfg, rid, meta)
+        audit(cfg, "approve" if approve else "deny", id=rid,
+              by=meta["decided_by"], uid=uid)
+        if approve:
+            threading.Thread(target=execute, args=(cfg, rid), daemon=True).start()
+        return {"ok": True, "id": rid, "state": meta["state"]}
+
+    def op_list(self, cfg):
+        out = []
+        for m in self.all_metas(cfg):
+            out.append(public_meta(cfg, m))
+        out.sort(key=lambda m: m["created"], reverse=True)
+        return out[:50]
+
+    def all_metas(self, cfg):
+        base = os.path.join(cfg["state"], "requests")
+        if not os.path.isdir(base):
+            return []
+        out = []
+        for rid in os.listdir(base):
+            m = read_meta(cfg, rid)
+            if m:
+                out.append(m)
+        return out
+
+    def identify(self, uid):
+        """Best-effort caller identity; self-declared name is separate."""
+        peer_pid = struct.unpack("3i", self.request.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))[0]
+        info = {"uid": uid, "pid": peer_pid, "exe": "", "cwd": ""}
+        try:
+            info["exe"] = os.readlink(f"/proc/{peer_pid}/exe")
+        except OSError:
+            pass
+        try:
+            info["cwd"] = os.readlink(f"/proc/{peer_pid}/cwd")
+        except OSError:
+            pass
+        return info
+
+
+def public_meta(cfg, meta):
+    m = dict(meta)
+    m.pop("token_sha256", None)          # never leaves the daemon
+    m["payload"] = os.path.join(req_dir(cfg, meta["id"]), "payload.sh")
+    return m
+
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+
+# ---------------------------------------------------------------- http page
+SHELL_PAGE = """<!doctype html>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>rootgate</title>
+<style>
+ body{font:16px/1.45 system-ui,sans-serif;max-width:46em;margin:1.2em auto;padding:0 1em;color:#111}
+ pre{background:#111;color:#eee;padding:.8em;overflow:auto;font-size:13px;border-radius:6px}
+ .k{color:#666;display:inline-block;min-width:6.5em}
+ button{font-size:1.05em;padding:.6em 1.2em;margin:.4em .6em .4em 0;border-radius:6px;border:1px solid #888}
+ .bad{background:#a11;color:#fff;border-color:#a11}
+ .ok{background:#116b2c;color:#fff;border-color:#116b2c}
+ code{word-break:break-all}
+</style>
+<h2>Privileged action requested</h2>
+<div id=meta>loading…</div>
+<div id=body></div>
+<script>
+const id = location.pathname.split("/").pop();
+const tok = new URLSearchParams(location.hash.slice(1)).get("t") || "";
+const el = (t, txt) => { const e = document.createElement(t); if (txt !== undefined) e.textContent = txt; return e; };
+const meta = document.getElementById("meta"), body = document.getElementById("body");
+
+function row(k, v) { const d = el("div"); d.append(el("span", k), el("span", v)); d.firstChild.className = "k"; meta.append(d); }
+
+fetch("/api/r/" + encodeURIComponent(id), {headers: {"X-Rootgate-Token": tok}})
+  .then(async r => {
+    const j = await r.json().catch(() => ({error: "http " + r.status}));
+    if (!r.ok) { meta.textContent = "Cannot show this request: " + (j.error || r.status); return; }
+    meta.textContent = "";
+    row("id", j.id); row("from", j.agent + " (uid " + j.uid + ", pid " + j.pid + ")");
+    row("exe", j.exe); row("cwd", j.cwd); row("what", j.desc);
+    row("sha256", j.sha256); row("expires", "in " + j.expires_in + "s");
+    body.append(el("p", "This runs as root if you approve. Read it first."));
+    body.append(el("pre", j.payload));
+    const okb = el("button", "Approve"); okb.className = "ok";
+    const nob = el("button", "Deny"); nob.className = "bad";
+    okb.onclick = () => decide("approve"); nob.onclick = () => decide("deny");
+    body.append(okb, nob);
+  })
+  .catch(e => { meta.textContent = "Error: " + e; });
+
+function decide(decision) {
+  fetch("/api/decide", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id, token: tok, decision})})
+    .then(async r => { const j = await r.json().catch(() => ({}));
+      body.textContent = r.ok ? ("Decision recorded: " + decision + ". You can close this page.")
+                              : ("Failed: " + (j.error || r.status)); })
+    .catch(e => { body.textContent = "Error: " + e; });
+}
+</script>
+"""
+
+
+class Page(http.server.BaseHTTPRequestHandler):
+    """Approval UI.
+
+    The token is carried in the URL *fragment* and sent as a request header, so
+    it never appears in a request line: reverse proxies, access logs and browser
+    history-recall at the server side cannot record it.
+    """
+    server_version = "rootgate/" + VERSION
+
+    def log_message(self, *_args):
+        pass
+
+    def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+        raw = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def _token_ok(self, meta):
+        got = self.headers.get("X-Rootgate-Token", "")
+        return bool(got) and hmac.compare_digest(
+            hashlib.sha256(got.encode()).hexdigest(), meta.get("token_sha256", ""))
+
+    def do_GET(self):
+        cfg = self.server.cfg
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/a/") or path.startswith("/a/"):
+            return self._send(200, SHELL_PAGE, "text/html; charset=utf-8")
+        if path.startswith("/api/r/"):
+            rid = path[len("/api/r/"):]
+            meta = read_meta(cfg, rid)
+            if not meta:
+                return self._json(404, {"error": "no such request"})
+            if not self._token_ok(meta):
+                return self._json(403, {"error": "bad or missing token"})
+            if meta["state"] != "pending":
+                return self._json(409, {"error": f"request is already {meta['state']}"})
+            if now() > meta["expires"]:
+                return self._json(410, {"error": "request expired"})
+            with open(os.path.join(req_dir(cfg, rid), "payload.sh")) as fh:
+                payload = fh.read()
+            return self._json(200, {
+                "id": rid, "agent": meta["agent"], "desc": meta["desc"],
+                "sha256": meta["sha256"], "payload": payload,
+                "uid": meta["submitter"]["uid"], "pid": meta["submitter"]["pid"],
+                "exe": meta["submitter"]["exe"], "cwd": meta["submitter"]["cwd"],
+                "expires_in": max(0, meta["expires"] - now()),
+            })
+        return self._send(404, "not found")
+
+    def do_POST(self):
+        cfg = self.server.cfg
+        if self.path.split("?", 1)[0] != "/api/decide":
+            return self._json(404, {"error": "not found"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            req = json.loads(self.rfile.read(min(n, 8192)) or b"{}")
+        except (ValueError, OSError):
+            return self._json(400, {"error": "bad body"})
+        rid = req.get("id", "")
+        token = req.get("token", "")
+        decision = req.get("decision", "")
+        if decision not in ("approve", "deny"):
+            return self._json(400, {"error": "decision must be approve or deny"})
+        meta = read_meta(cfg, rid)
+        if not meta:
+            return self._json(404, {"error": "no such request"})
+        if not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
+                                   meta.get("token_sha256", "")):
+            audit(cfg, "decision_rejected", id=rid, by="page")
+            return self._json(403, {"error": "bad token"})
+        if not approve_or_deny(cfg, rid, token, approve=(decision == "approve")):
+            return self._json(409, {"error": "could not apply (expired or already decided)"})
+        return self._json(200, {"ok": True, "state": decision})
+
+
+def approve_or_deny(cfg, rid, token, approve):
+    meta = read_meta(cfg, rid)
+    if not meta or meta["state"] != "pending":
+        return False
+    if now() > meta["expires"]:
+        meta["state"] = "expired"
+        write_meta(cfg, rid, meta)
+        return False
+    if not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
+                               meta.get("token_sha256", "")):
+        return False
+    meta["state"] = "approved" if approve else "denied"
+    meta["decided_by"] = "token"
+    meta["decided"] = now()
+    write_meta(cfg, rid, meta)
+    audit(cfg, "approve" if approve else "deny", id=rid, by="token")
+    if approve:
+        threading.Thread(target=execute, args=(cfg, rid), daemon=True).start()
+    return True
+
+
+# ---------------------------------------------------------------- commands
+def call(cfg, req, timeout=30):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(cfg["socket"])
+    s.sendall((json.dumps(req) + "\n").encode())
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    s.close()
+    return json.loads(buf or b"{}")
+
+
+def cmd_serve(args, cfg):
+    for d in (cfg["state"], os.path.join(cfg["state"], "requests"),
+              os.path.dirname(cfg["socket"]), os.path.dirname(cfg["log"])):
+        os.makedirs(d, exist_ok=True)
+    if os.path.exists(cfg["socket"]):
+        os.unlink(cfg["socket"])
+    srv = Server(cfg["socket"], Handler)
+    srv.cfg = cfg
+    os.chmod(cfg["socket"], 0o660)
+    if cfg["notify"] == "file" and not cfg["notify_file"]:
+        raise SystemExit("notify=file needs notify_file")
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", int(cfg["http_port"])), Page)
+    httpd.cfg = cfg
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"rootgate {VERSION}: socket {cfg['socket']}, page 127.0.0.1:{cfg['http_port']}, "
+          f"notify={cfg['notify']}, euid={os.geteuid()}", flush=True)
+    try:
+        srv.serve_forever()
+    finally:
+        srv.server_close()
+        if os.path.exists(cfg["socket"]):
+            os.unlink(cfg["socket"])
+
+
+def cmd_submit(args, cfg):
+    raw = sys.stdin.buffer.read() if args.file == "-" else open(args.file, "rb").read()
+    resp = call(cfg, {"op": "submit", "script": base64.b64encode(raw).decode(),
+                      "desc": args.desc, "name": args.name})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    print(f"submitted {resp['id']}")
+    print(f"sha256    {resp['sha256']}")
+    print(f"expires   {time.strftime('%H:%M:%S', time.localtime(resp['expires']))}")
+    print("the approval request went to the human's channel; wait with:")
+    print(f"  rootgate wait {resp['id']}")
+    return 0
+
+
+def cmd_status(args, cfg):
+    resp = call(cfg, {"op": "status", "id": args.id})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    m = resp["meta"]
+    for k in ("id", "state", "exit_code", "desc", "agent", "sha256", "created", "expires"):
+        if k in m:
+            print(f"{k:10} {m[k]}")
+    return 0
+
+
+def cmd_wait(args, cfg):
+    resp = call(cfg, {"op": "wait", "id": args.id, "timeout": args.timeout}, timeout=args.timeout + 10)
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    m = resp["meta"]
+    print(f"{m['id']}: {m['state']}" + (f" rc={m.get('exit_code')}" if "exit_code" in m else ""))
+    if args.verbose or m["state"] in ("done", "failed"):
+        log = call(cfg, {"op": "log", "id": args.id}).get("log", "")
+        if log:
+            print("--- log ---")
+            print(log)
+    return 0 if m["state"] == "done" else 1
+
+
+def cmd_list(args, cfg):
+    resp = call(cfg, {"op": "list"})
+    for m in resp.get("requests", []):
+        rc = f" rc={m['exit_code']}" if "exit_code" in m else ""
+        print(f"{m['id']}  {m['state']:9}{rc:8} {m['agent']:14} {m['desc'][:60]}")
+    return 0
+
+
+def cmd_approve(args, cfg):
+    # Local root approval: root presence is the human factor. Show the payload,
+    # require the operator to echo the hash prefix, then decide without a token.
+    if os.geteuid() != 0:
+        print("rootgate approve must run as root (sudo rootgate approve <id>)\n"
+              "otherwise use the link sent to the human's channel.", file=sys.stderr)
+        return 1
+    resp = call(cfg, {"op": "status", "id": args.id})
+    if not resp.get("ok"):
+        print("error:", resp.get("error"), file=sys.stderr)
+        return 1
+    m = resp["meta"]
+    with open(m["payload"]) as fh:
+        payload = fh.read()
+    print(f"id      {m['id']}\nfrom    {m['agent']} (uid {m['submitter']['uid']})\n"
+          f"what    {m['desc']}\nsha256  {m['sha256']}\n")
+    print("--- payload ---")
+    print(payload)
+    print("---------------")
+    prefix = m["sha256"][:8]
+    if args.yes:
+        print("approving without confirmation (--yes)")
+    else:
+        try:
+            typed = input(f"type {prefix} to approve this exact payload: ").strip()
+        except EOFError:
+            return 1
+        if typed != prefix:
+            print("not approved", file=sys.stderr)
+            return 1
+    out = call(cfg, {"op": "approve", "id": args.id})
+    print(out.get("state") if out.get("ok") else out.get("error"))
+    return 0 if out.get("ok") else 1
+
+
+def cmd_deny(args, cfg):
+    out = call(cfg, {"op": "deny", "id": args.id})
+    print(out.get("state") if out.get("ok") else out.get("error"))
+    return 0 if out.get("ok") else 1
+
+
+def cmd_log(args, cfg):
+    print(call(cfg, {"op": "log", "id": args.id}).get("log", ""), end="")
+    return 0
+
+
+def main(argv=None):
+    cfg = load_config()
+    p = argparse.ArgumentParser(prog="rootgate", description="agent-agnostic privileged action broker")
+    p.add_argument("--socket")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("serve", help="run the daemon")
+    s.set_defaults(fn=cmd_serve)
+
+    s = sub.add_parser("submit", help="submit a payload for approval")
+    s.add_argument("file", help="script to run as root, or - for stdin")
+    s.add_argument("--desc", required=True, help="one line: what this does")
+    s.add_argument("--name", default=os.environ.get("ROOTGATE_AGENT", "unknown"),
+                   help="who is asking (informational, shown to the human)")
+    s.set_defaults(fn=cmd_submit)
+
+    s = sub.add_parser("status", help="show one request")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("wait", help="block until a request finishes")
+    s.add_argument("id")
+    s.add_argument("--timeout", type=int, default=180)
+    s.add_argument("-v", "--verbose", action="store_true")
+    s.set_defaults(fn=cmd_wait)
+
+    s = sub.add_parser("log", help="print the request's log")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("list", help="recent requests")
+    s.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("approve", help="approve locally (root only)")
+    s.add_argument("id")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(fn=cmd_approve)
+
+    s = sub.add_parser("deny", help="deny a pending request")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_deny)
+
+    args = p.parse_args(argv)
+    if args.socket:
+        cfg["socket"] = args.socket
+    return args.fn(args, cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

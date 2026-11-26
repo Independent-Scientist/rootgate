@@ -1,0 +1,27 @@
+# Publishing the approval page from a machine that needs it
+#
+# Run rootgate on the machine that holds the privilege (it binds 127.0.0.1:8733
+# and nothing else), then forward only that port. Never expose the daemon
+# directly and never bind it to 0.0.0.0.
+
+{$ROOTGATE_DOMAIN} {
+	reverse_proxy 127.0.0.1:8733
+
+	# The approval token travels in the URL fragment and is sent as a header, so
+	# it is never in a request line. Still: do not log query strings or headers.
+	log {
+		output discard
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Nothing here needs a body larger than a decision.
+	request_body {
+		max_size 8KB
+	}
+}
