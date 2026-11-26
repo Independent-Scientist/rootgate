@@ -28,12 +28,18 @@ trap cleanup EXIT
 start() {  # start(ttl, min_interval)
 	export ROOTGATE_TTL=${1:-600}
 	export ROOTGATE_MIN_INTERVAL=${2:-0}
+	# A socket file left by the previous daemon exists but refuses connections, so
+	# wait for an answer, not for the path. (This made the expiry test flaky.)
+	rm -f "$ROOTGATE_SOCKET"
 	$RG serve >>"$T/daemon.log" 2>&1 &
 	SRV=$!
-	for _ in $(seq 50); do
-		[ -S "$ROOTGATE_SOCKET" ] && break
+	for _ in $(seq 60); do
+		if $RG list >/dev/null 2>&1; then return 0; fi
 		sleep 0.1
 	done
+	echo "daemon did not answer on $ROOTGATE_SOCKET" >&2
+	cat "$T/daemon.log" >&2
+	return 1
 }
 stop() { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; SRV=; }
 
