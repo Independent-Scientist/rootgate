@@ -55,6 +55,7 @@ Installs `/usr/local/sbin/rootgate`, `/etc/systemd/system/rootgate.service`,
 | key | meaning |
 |---|---|
 | `notify` | `console` (default), `telegram`, `ntfy`, `file` (tests only) |
+| `telegram_poll` | `1` only with a bot dedicated to rootgate; enables inline buttons |
 | `public_base` | external base URL for approval links, e.g. `https://abc.ngrok-free.app`; empty means `http://127.0.0.1:8733` (useless from a phone) |
 | `http_port` | approval page port, bound to 127.0.0.1 only |
 | `ttl` | seconds an approval stays valid |
@@ -137,6 +138,24 @@ behave — one purpose per submission, rollback in the script, no password
 requests, what "denied" means. Install it where your agent reads skills
 (Hermes: `~/.hermes/skills/`, Claude Code: `.claude/skills/`). Both are shipped;
 neither replaces the other.
+
+## Approving inside Telegram (inline buttons)
+
+With `"notify": "telegram"` the request arrives as a message with **✅ Approve**
+and **⛔ Deny** buttons. A press is verified three ways before anything runs:
+
+- `callback_data` is `a|d:<id>:<16 hex>`, where the hex is `HMAC-SHA256(key=token_sha256, "action:id")`.
+  The requester never sees `token_sha256`, so it cannot forge a press for its own
+  request;
+- the press must come from the configured `TELEGRAM_CHAT_ID`;
+- the decision still goes through the normal path (hash re-checked, single use,
+  TTL), and the result — `rc` plus the log — is posted back into the chat.
+
+**This needs a bot the daemon owns.** Set `"telegram_poll": "1"` only for such a
+bot. Telegram keeps a single update queue per bot: if an agent gateway is polling
+the same token, the two consumers steal each other's updates — the daemon would
+swallow the agent's messages, and the agent the button presses. The default is
+`0` (link-only approvals) deliberately.
 
 ## Publishing the page to a phone
 

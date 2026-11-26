@@ -40,6 +40,7 @@ DEFAULTS = {
     "ntfy_url": "https://ntfy.sh",
     "ntfy_topic": "",
     "socket_mode": "0666",       # see README: any local user may *ask*; approval is separate
+    "telegram_poll": "0",       # inline-button callbacks; ONLY with a dedicated bot
     "max_pending": "3",
     "min_interval": "5",
     "exec_timeout": "900",
@@ -109,6 +110,19 @@ def payload_sha(cfg, rid):
     return sha256_file(os.path.join(req_dir(cfg, rid), "payload.sh"))
 
 
+def telegram_api(cfg, method, payload=None, timeout=40):
+    secrets = read_secrets(cfg)
+    tok = secrets.get("TELEGRAM_BOT_TOKEN")
+    if not tok:
+        raise RuntimeError("no TELEGRAM_BOT_TOKEN in the secrets file")
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{tok}/{method}",
+        data=json.dumps(payload or {}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
 def notify(cfg, rid, meta, token):
     base = cfg["public_base"] or f"http://127.0.0.1:{cfg['http_port']}"
     url = f"{base}/a/{token}"
@@ -155,19 +169,19 @@ def notify(cfg, rid, meta, token):
         chat = secrets.get("TELEGRAM_CHAT_ID")
         if not tok or not chat:
             raise RuntimeError("notify=telegram needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
-        text = head + f"\nApproval: {url}"
-        req = urllib.request.Request(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            data=json.dumps({
-                "chat_id": chat,
-                "text": text,
-                "disable_web_page_preview": True,
-                "reply_markup": {"inline_keyboard": [[
-                    {"text": "Review and approve", "url": url}]]},
-            }).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST")
-        urllib.request.urlopen(req, timeout=15).read()
+        # Approve/deny inline: one tap, no browser, no tunnel. The callback_data
+        # carries an HMAC the requester cannot compute, and the bot only accepts
+        # presses from the configured chat id.
+        keyboard = {"inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": cb_data(meta, "a")},
+            {"text": "⛔ Deny", "callback_data": cb_data(meta, "d")},
+        ]]}
+        text = head
+        if cfg["public_base"]:
+            text += f"\nweb: {url}"
+        telegram_api(cfg, "sendMessage", {
+            "chat_id": chat, "text": text,
+            "disable_web_page_preview": True, "reply_markup": keyboard})
         return
     raise RuntimeError(f"unknown notify backend {cfg['notify']}")
 
@@ -184,6 +198,88 @@ def read_secrets(cfg):
                 k, v = line.split("=", 1)
                 out[k.strip()] = v.strip()
     return out
+
+
+def poll_telegram(cfg):
+    """Long-poll the bot for inline-button presses.
+
+    Requires a bot the daemon owns: two consumers of the same token (this and an
+    agent gateway) steal each other's updates.
+    """
+    offset = None
+    while True:
+        try:
+            body = {"timeout": 25, "allowed_updates": ["callback_query"]}
+            if offset is not None:
+                body["offset"] = offset
+            upd = telegram_api(cfg, "getUpdates", body, timeout=40)
+            for u in upd.get("result", []):
+                offset = u["update_id"] + 1
+                cq = u.get("callback_query")
+                if cq:
+                    handle_callback(cfg, cq)
+        except Exception:                                  # noqa: BLE001
+            time.sleep(5)
+
+
+def handle_callback(cfg, cq):
+    parts = (cq.get("data") or "").split(":")
+    if len(parts) != 3:
+        return
+    action, rid, sig = parts
+    meta = read_meta(cfg, rid)
+    chat = str(read_secrets(cfg).get("TELEGRAM_CHAT_ID", ""))
+    who = str((cq.get("from") or {}).get("id", ""))
+    cq_id = cq.get("id")
+
+    if not meta:
+        telegram_api(cfg, "answerCallbackQuery",
+                     {"callback_query_id": cq_id, "text": "unknown request", "show_alert": True})
+        return
+    if not hmac.compare_digest(cb_sig(meta, action), sig) or (chat and who != chat):
+        audit(cfg, "decision_rejected", id=rid, by="telegram", from_id=who)
+        telegram_api(cfg, "answerCallbackQuery",
+                     {"callback_query_id": cq_id, "text": "not authorised", "show_alert": True})
+        return
+
+    approve = action == "a"
+    ok = apply_decision(cfg, rid, approve, by="telegram")
+    verdict = ("approved" if approve else "denied") if ok else "already decided or expired"
+    telegram_api(cfg, "answerCallbackQuery", {"callback_query_id": cq_id, "text": verdict})
+
+    msg = cq.get("message") or {}
+    mid = msg.get("message_id")
+    if mid:
+        stamp = time.strftime("%H:%M:%S")
+        telegram_api(cfg, "editMessageText", {
+            "chat_id": chat, "message_id": mid,
+            "text": (msg.get("text") or rid) + f"\n\n→ {verdict} at {stamp}",
+            "reply_markup": {"inline_keyboard": []}})
+    if ok and approve:
+        threading.Thread(target=report_result, args=(cfg, rid, chat, mid), daemon=True).start()
+
+
+def report_result(cfg, rid, chat, reply_to):
+    """Send the outcome back to the chat once the payload has finished."""
+    for _ in range(1800):
+        meta = read_meta(cfg, rid)
+        if meta and meta["state"] in ("done", "failed", "refused"):
+            log_path = os.path.join(req_dir(cfg, rid), "run.log")
+            tail = ""
+            if os.path.exists(log_path):
+                with open(log_path, "rb") as fh:
+                    tail = fh.read()[-1200:].decode("utf-8", "replace")
+            text = f"{rid} → {meta['state']}"
+            if "exit_code" in meta:
+                text += f" (rc={meta['exit_code']})"
+            if tail:
+                text += "\n\n" + tail
+            try:
+                telegram_api(cfg, "sendMessage", {"chat_id": chat, "text": text[:3900]})
+            except Exception:                              # noqa: BLE001
+                pass
+            return
+        time.sleep(0.5)
 
 
 # ---------------------------------------------------------------- execution
@@ -568,7 +664,8 @@ class Page(http.server.BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "state": decision})
 
 
-def approve_or_deny(cfg, rid, token, approve):
+def apply_decision(cfg, rid, approve, by):
+    """Record a decision; the caller has already authorised it."""
     meta = read_meta(cfg, rid)
     if not meta or meta["state"] != "pending":
         return False
@@ -576,17 +673,39 @@ def approve_or_deny(cfg, rid, token, approve):
         meta["state"] = "expired"
         write_meta(cfg, rid, meta)
         return False
-    if not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
-                               meta.get("token_sha256", "")):
-        return False
     meta["state"] = "approved" if approve else "denied"
-    meta["decided_by"] = "token"
+    meta["decided_by"] = by
     meta["decided"] = now()
     write_meta(cfg, rid, meta)
-    audit(cfg, "approve" if approve else "deny", id=rid, by="token")
+    audit(cfg, "approve" if approve else "deny", id=rid, by=by)
     if approve:
         threading.Thread(target=execute, args=(cfg, rid), daemon=True).start()
     return True
+
+
+def approve_or_deny(cfg, rid, token, approve):
+    meta = read_meta(cfg, rid)
+    if not meta:
+        return False
+    if not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
+                               meta.get("token_sha256", "")):
+        return False
+    return apply_decision(cfg, rid, approve, by="token")
+
+
+def cb_sig(meta, action):
+    """Button-press authorisation: HMAC over (action, id) keyed by the token hash.
+
+    The agent never sees token_sha256, so it cannot forge a callback for a
+    request it submitted. 16 hex chars keeps callback_data under Telegram's
+    64-byte limit.
+    """
+    key = meta["token_sha256"].encode()
+    return hmac.new(key, f"{action}:{meta['id']}".encode(), hashlib.sha256).hexdigest()[:16]
+
+
+def cb_data(meta, action):
+    return f"{action}:{meta['id']}:{cb_sig(meta, action)}"
 
 
 # ---------------------------------------------------------------- commands
@@ -623,6 +742,14 @@ def cmd_serve(args, cfg):
     os.chmod(cfg["socket"], int(cfg["socket_mode"], 8))
     if cfg["notify"] == "file" and not cfg["notify_file"]:
         raise SystemExit("notify=file needs notify_file")
+    if cfg["notify"] == "telegram":
+        if str(cfg.get("telegram_poll", "0")) not in ("0", "false", ""):
+            print("rootgate: polling the bot for inline-button presses "
+                  "(this bot must not also be used by an agent gateway)", flush=True)
+            threading.Thread(target=poll_telegram, args=(cfg,), daemon=True).start()
+        else:
+            print("rootgate: telegram_poll disabled - approval is by link only; "
+                  "inline buttons need a dedicated bot", flush=True)
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", int(cfg["http_port"])), Page)
     httpd.cfg = cfg
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
