@@ -110,6 +110,21 @@ def payload_sha(cfg, rid):
     return sha256_file(os.path.join(req_dir(cfg, rid), "payload.sh"))
 
 
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_only(host, port, family=0, type_=0, proto=0, flags=0):
+    """Force A-record resolution for outbound API calls.
+
+    Where IPv6 is advertised but unroutable, urllib spends the full timeout on
+    the AAAA attempt before trying IPv4 -- a 30s stall per notification.
+    """
+    return _real_getaddrinfo(host, port, socket.AF_INET, type_, proto, flags)
+
+
+socket.getaddrinfo = _ipv4_only
+
+
 def telegram_api(cfg, method, payload=None, timeout=40):
     secrets = read_secrets(cfg)
     tok = secrets.get("TELEGRAM_BOT_TOKEN")
@@ -198,6 +213,19 @@ def read_secrets(cfg):
                 k, v = line.split("=", 1)
                 out[k.strip()] = v.strip()
     return out
+
+
+def _notify_async(cfg, rid, meta, token):
+    """Deliver the approval request without blocking the submitter."""
+    try:
+        notify(cfg, rid, meta, token)
+        audit(cfg, "notified", id=rid)
+    except Exception as exc:                          # noqa: BLE001
+        latest = read_meta(cfg, rid) or meta
+        latest["state"] = "cancelled"
+        latest["error"] = f"notification failed: {exc}"
+        write_meta(cfg, rid, latest)
+        audit(cfg, "notify_failed", id=rid, error=str(exc))
 
 
 def poll_telegram(cfg):
@@ -438,13 +466,8 @@ class Handler(socketserver.StreamRequestHandler):
         write_meta(cfg, rid, meta)
         audit(cfg, "submit", id=rid, uid=uid, agent=meta["agent"],
               sha256=meta["sha256"], desc=meta["desc"])
-        try:
-            notify(cfg, rid, meta, token)
-        except Exception as exc:                      # noqa: BLE001
-            meta["state"] = "cancelled"
-            meta["error"] = f"notification failed: {exc}"
-            write_meta(cfg, rid, meta)
-            return {"ok": False, "error": meta["error"], "id": rid}
+        threading.Thread(target=_notify_async, args=(cfg, rid, meta, token),
+                         daemon=True).start()
         # NOTE: the token is deliberately absent from this response.
         return {"ok": True, "id": rid, "sha256": meta["sha256"],
                 "expires": meta["expires"],
